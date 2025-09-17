@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>3D Cell Viewer + QR</title>
+  <!-- itk-vtk-viewer (volume renderer that runs entirely in the browser) -->
+  <script src="https://unpkg.com/itk-wasm/dist/itk-wasm.min.js"></script>
+  <script src="https://unpkg.com/itk-vtk-viewer/dist/itkVtkViewerCDN.js"></script>
+  <!-- Lightweight QR code generator -->
+  <script src="https://unpkg.com/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <style>
+    :root { --bg:#0b0f14; --ink:#e8f0ff; --muted:#9db2ce; --accent:#72a1ff; }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"}
+    .wrap{display:grid;grid-template-columns:1fr 340px;gap:16px;height:100%;}
+    .viewer{position:relative;height:100%;}
+    #viewer{position:absolute;inset:0;}
+    .side{padding:16px;border-left:1px solid #1a2330;display:flex;flex-direction:column;gap:16px;}
+    h1{font-size:18px;margin:0 0 8px 0;font-weight:600}
+    .card{background:#0f1621;border:1px solid #1b2736;border-radius:16px;padding:14px}
+    .drop{border:2px dashed #2a3c56;border-radius:16px;padding:18px;text-align:center;color:var(--muted)}
+    .drop.drag{border-color:var(--accent);color:var(--ink)}
+    .row{display:flex;gap:8px;align-items:center}
+    input[type="text"],input[type="url"]{width:100%;background:#0b1220;color:var(--ink);border:1px solid #213047;border-radius:12px;padding:10px}
+    button{background:var(--accent);border:none;color:#081223;border-radius:12px;padding:10px 14px;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .hint{color:var(--muted);font-size:12px}
+    .qrbox{display:flex;justify-content:center}
+    a{color:#9fc0ff;text-decoration:none}
+    .small{font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="viewer">
+      <div id="viewer"></div>
+    </div>
+    <aside class="side">
+      <div class="card">
+        <h1>Load your 3D stack</h1>
+        <div id="dropzone" class="drop">Drop a volume file here (OME‑TIFF, NIfTI .nii/.nii.gz, NRRD .nrrd, MHD/RAW, or DICOM folder)<br/><span class="small">You can also use the file picker below.</span></div>
+        <div class="row" style="margin-top:10px">
+          <input id="file" type="file" multiple webkitdirectory directory />
+          <button id="pickOne">Pick file</button>
+        </div>
+        <div class="row">
+          <input id="urlInput" type="url" placeholder="…or paste a direct file URL (https://…)" />
+          <button id="loadUrl">Load URL</button>
+        </div>
+        <div class="hint">Tip: For a DICOM series, choose its folder. For z‑stacks, export as OME‑TIFF, NRRD, or NIfTI via Fiji/ImageJ and drop the file here.</div>
+      </div>
+      <div class="card">
+        <h1>Share via QR</h1>
+        <div class="hint">This QR points to <code id="linkText"></code>. Host this HTML (and your volume file) on GitHub Pages, Netlify, S3, etc. If you load using a URL, the viewer will remember it in the page link.</div>
+        <div class="qrbox"><div id="qrcode"></div></div>
+        <div class="row"><button id="copyLink">Copy Link</button><a id="openLink" href="#" target="_blank">Open Link</a></div>
+      </div>
+      <div class="card">
+        <h1>Shortcuts</h1>
+        <div class="hint">Mouse: Left‑drag rotate, Right‑drag pan, Wheel zoom. Press <b>V</b> for volume/iso, <b>R</b> reset, <b>L</b> toggle light, <b>C</b> toggle UI.</div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    // --- Globals
+    let viewer, container = document.getElementById('viewer')
+
+    async function ensureViewer() {
+      if (viewer) return viewer
+      viewer = await itkVtkViewer.createViewer(container, { uiCollapsed: false, rotate: true })
+      return viewer
+    }
+
+    // --- Utilities
+    async function loadFileList(fileList) {
+      const v = await ensureViewer()
+      const files = Array.from(fileList)
+
+      // If a single file (e.g., .nii, .nrrd, .tif/.ome.tif)
+      if (files.length === 1 && files[0] instanceof File) {
+        const file = files[0]
+        const arrayBuffer = await file.arrayBuffer()
+        const { image } = await itkVtkViewer.readImageArrayBuffer(file.name, arrayBuffer)
+        await v.setImage(image)
+        rememberLink({ name: file.name })
+        return
+      }
+
+      // If a directory (e.g., DICOM series)
+      // itk-vtk-viewer can try to read from a list of files
+      const fileBuffers = await Promise.all(files.map(async (f) => ({ name: f.webkitRelativePath || f.name, buffer: await f.arrayBuffer() })))
+      const { image } = await itkVtkViewer.readImageFileSeries(fileBuffers)
+      await v.setImage(image)
+      rememberLink({})
+    }
+
+    async function loadFromURL(url) {
+      const v = await ensureViewer()
+      const response = await fetch(url)
+      if (!response.ok) throw new Error('Failed to fetch file: ' + response.status)
+      const arrayBuffer = await response.arrayBuffer()
+      const filename = url.split('/').pop() || 'volume'
+      const { image } = await itkVtkViewer.readImageArrayBuffer(filename, arrayBuffer)
+      await v.setImage(image)
+      rememberLink({ url })
+    }
+
+    function getShareURL(urlParam) {
+      const u = new URL(window.location.href)
+      if (urlParam) {
+        u.searchParams.set('src', urlParam)
+      } else {
+        u.searchParams.delete('src')
+      }
+      return u.toString()
+    }
+
+    function rememberLink({ url, name }) {
+      const link = getShareURL(url || (name ? name : null))
+      updateQR(link)
+    }
+
+    function updateQR(link) {
+      document.getElementById('linkText').textContent = link
+      document.getElementById('openLink').href = link
+      const qrEl = document.getElementById('qrcode')
+      qrEl.innerHTML = ''
+      new QRCode(qrEl, { text: link, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.M })
+    }
+
+    // --- UI wiring
+    const drop = document.getElementById('dropzone')
+    drop.addEventListener('dragover', (e)=>{ e.preventDefault(); drop.classList.add('drag') })
+    drop.addEventListener('dragleave', ()=> drop.classList.remove('drag'))
+    drop.addEventListener('drop', (e)=>{ e.preventDefault(); drop.classList.remove('drag'); loadFileList(e.dataTransfer.files) })
+
+    const fileInput = document.getElementById('file')
+    document.getElementById('pickOne').addEventListener('click', ()=> fileInput.click())
+    fileInput.addEventListener('change', ()=> { if (fileInput.files?.length) loadFileList(fileInput.files) })
+
+    const urlInput = document.getElementById('urlInput')
+    document.getElementById('loadUrl').addEventListener('click', ()=> { if (urlInput.value) loadFromURL(urlInput.value) })
+
+    document.getElementById('copyLink').addEventListener('click', async ()=>{
+      const link = document.getElementById('openLink').href
+      await navigator.clipboard.writeText(link)
+      const btn = event.target; const old = btn.textContent; btn.textContent = 'Copied!'; setTimeout(()=>btn.textContent=old, 1200)
+    })
+
+    // On load, if ?src= URL (or filename), try to fetch it as a URL
+    (async function boot(){
+      const params = new URLSearchParams(window.location.search)
+      const src = params.get('src')
+      updateQR(getShareURL(src || null))
+      if (!src) return
+      try {
+        if (/^https?:\/\//i.test(src)) await loadFromURL(src)
+        else console.warn('src is not a URL; host the volume and set ?src=https://…')
+      } catch (err) {
+        console.error(err)
+        alert('Could not load the provided src. Check the URL and CORS settings.')
+      }
+    })()
+  </script>
+</body>
+</html>
